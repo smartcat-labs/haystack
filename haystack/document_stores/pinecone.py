@@ -314,7 +314,7 @@ class PineconeDocumentStore(BaseDocumentStore):
             if not filters:
                 filters = {self.type_metadata_field: {"$eq": type_value}}
 
-            if "$and" in filters:
+            elif "$and" in filters:
                 and_filters_keys = [list(and_filter)[0] for and_filter in filters["$and"]]
 
                 if self.type_metadata_field in and_filters_keys:

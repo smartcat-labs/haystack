@@ -678,3 +678,44 @@ class TestPineconeDocumentStore(DocumentStoreBaseTestAbstract):
         }
         retrieved_docs = mocked_ds.get_all_documents()
         assert retrieved_docs[0].meta["_split_overlap"] == [{"doc_id": "test_id", "range": [0, 10]}]
+
+    @pytest.mark.unit
+    def test_add_type_metadata_filter(self, doc_store_with_docs: PineconeDocumentStore):
+        filters = (
+            # empty filters
+            {},
+            # filters without $and
+            {"doc_type": "val1"},
+            {"doc_type": {"$eq": "val1"}},
+            {"doc_type": {"$in": ["val1", "val2"]}},
+            # filters with $and
+            {"$and": [{"genre": "comedy"}, {"year": 2019}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": "val1"}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": {"$eq": "val1"}}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": {"$in": ["val1", "val2"]}}]},
+            # others
+            # {"genre": {"$in": ["documentary", "action"]}},
+            # {"$or": [{"genre": "comedy"}, {"doc_type": "something_else"}]},
+        )
+        type_value = "val_new"
+
+        expected_updated_filters = [
+            # empty filters
+            {"doc_type": {"$eq": "val_new"}},
+            # filters without $and
+            {"doc_type": {"$in": ["val_new", "val1"]}},
+            {"doc_type": {"$in": ["val_new", "val1"]}},
+            {"doc_type": {"$in": ["val_new", "val1", "val2"]}},
+            # filters with $and
+            {"$and": [{"genre": "comedy"}, {"year": 2019}, {"doc_type": {"$eq": "val_new"}}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": {"$in": ["val_new", "val1"]}}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": {"$in": ["val_new", "val1"]}}]},
+            {"$and": [{"genre": "comedy"}, {"doc_type": {"$in": ["val_new", "val1", "val2"]}}]},
+            # others
+            # {"genre": {"$in": ["documentary", "action"]}},
+            # {"$or": [{"genre": "comedy"}, {"doc_type": "something_else"}]},
+        ]
+
+        updated_filters = [doc_store_with_docs._add_type_metadata_filter(filter, type_value) for filter in filters]
+
+        assert updated_filters == expected_updated_filters
