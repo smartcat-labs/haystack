@@ -5,7 +5,7 @@ import logging
 import operator
 from functools import reduce
 from itertools import islice
-from typing import Any, Dict, Generator, List, Optional, Union
+from typing import Any, Dict, Generator, List, Optional, Union, cast
 
 import numpy as np
 from tqdm import tqdm
@@ -287,14 +287,14 @@ class PineconeDocumentStore(BaseDocumentStore):
             filters = {}
         return filters
 
-    def _update_and_filters(self, and_filters: List[Dict], updated_value: Dict) -> List[Dict]:
+    def _update_and_filters(self, and_filters: List[Dict], updated_value: Dict[str, Dict]) -> List[Dict]:
         for filter in and_filters:
             filter.update(
                 (k, updated_value[self.type_metadata_field]) for k, v in filter.items() if k == self.type_metadata_field
             )
         return and_filters
 
-    def _update_metadata_filter(self, type_value: str, current_type_filter) -> FilterType:
+    def _update_metadata_filter(self, type_value: str, current_type_filter) -> Dict[str, Dict]:
         type_values = [type_value]
         if isinstance(current_type_filter, str):
             type_values.append(current_type_filter)
@@ -315,22 +315,24 @@ class PineconeDocumentStore(BaseDocumentStore):
                 filters = {self.type_metadata_field: {"$eq": type_value}}
 
             elif "$and" in filters:
-                and_filters_keys = [list(and_filter)[0] for and_filter in filters["$and"]]
+                and_filters_list = cast(list, filters["$and"])  # mypy fix
+                and_filters_keys = [list(and_filter)[0] for and_filter in and_filters_list]
 
                 if self.type_metadata_field in and_filters_keys:
                     current_type_filter = [
-                        and_filters for and_filters in filters["$and"] if self.type_metadata_field in and_filters
+                        and_filter for and_filter in and_filters_list if self.type_metadata_field in and_filter
                     ][0][self.type_metadata_field]
                     new_type_filter = self._update_metadata_filter(type_value, current_type_filter)
-                    filters = self._update_and_filters(filters["$and"], new_type_filter)
+                    filters = self._update_and_filters(and_filters_list, new_type_filter)  # type: ignore
 
                 else:
                     new_type_filter = {self.type_metadata_field: {"$eq": type_value}}
-                    filters["$and"].append(new_type_filter)
+                    and_filters_list.append(new_type_filter)
+                    filters["$and"] = and_filters_list
 
             elif self.type_metadata_field in filters:
                 current_type_filter = filters[self.type_metadata_field]
-                filters = self._update_metadata_filter(type_value, current_type_filter)
+                filters = self._update_metadata_filter(type_value, current_type_filter)  # type: ignore
 
             else:
                 new_type_filter = {self.type_metadata_field: {"$eq": type_value}}
