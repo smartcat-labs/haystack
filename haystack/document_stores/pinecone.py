@@ -6,7 +6,7 @@ import logging
 import operator
 from functools import reduce
 from itertools import islice
-from typing import Any, Dict, Generator, List, Literal, Optional, Union
+from typing import Any, Dict, Generator, List, Literal, Optional, Set, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -332,13 +332,25 @@ class PineconeDocumentStore(BaseDocumentStore):
             type_metadata_value = self.document_without_embedding_metadata
         return type_metadata_value
 
-    def _get_vector_count(self, index: str, filters: Optional[FilterType], namespace: Optional[str]) -> int:
+    def _get_vector_count(
+        self, index: str, filters: Optional[FilterType], namespace: Optional[str], types_metadata: Set[DocTypeMetadata]
+    ) -> int:
+        index = self._index(index)
+        self._index_connection_exists(index)
+
+        filters = filters or {}
+        for type_value in types_metadata:
+            # add filter for each `doc_type` metadata value
+            filters = self._add_type_metadata_filter(filters, type_value)
+
+        pinecone_syntax_filter = LogicalFilterClause.parse(filters).convert_to_pinecone() if filters else None
+
         res = self.pinecone_indexes[index].query(
             self.dummy_query,
             top_k=self.top_k_limit,
             include_values=False,
             include_metadata=False,
-            filter=filters,
+            filter=pinecone_syntax_filter,
             namespace=namespace,
         )
         return len(res["matches"])
@@ -393,22 +405,13 @@ class PineconeDocumentStore(BaseDocumentStore):
         if headers:
             raise NotImplementedError("PineconeDocumentStore does not support headers.")
 
-        index = self._index(index)
-        self._index_connection_exists(index)
+        # add `doc_type` value if specified, otherwise default is related to documents without embeddings
+        types_metadata = {type_metadata or self.document_without_embedding_metadata}
+        if not type_metadata and not only_documents_without_embedding:
+            # add `doc_type` related to documents with embeddings
+            types_metadata.add(self.document_with_embedding_metadata)
 
-        filters = filters or {}
-        if not type_metadata:
-            # add filter for `doc_type` metadata related to documents without embeddings
-            filters = self._add_type_metadata_filter(filters, type_value=self.document_without_embedding_metadata)
-            if not only_documents_without_embedding:
-                # add filter for `doc_type` metadata related to documents with embeddings
-                filters = self._add_type_metadata_filter(filters, type_value=self.document_with_embedding_metadata)
-        else:
-            # if value for `doc_type` metadata is specified, add filter with given value
-            filters = self._add_type_metadata_filter(filters, type_value=type_metadata)
-
-        pinecone_syntax_filter = LogicalFilterClause.parse(filters).convert_to_pinecone() if filters else None
-        return self._get_vector_count(index, filters=pinecone_syntax_filter, namespace=namespace)
+        return self._get_vector_count(index, filters=filters, namespace=namespace, types_metadata=types_metadata)
 
     def get_embedding_count(
         self, filters: Optional[FilterType] = None, index: Optional[str] = None, namespace: Optional[str] = None
@@ -417,17 +420,36 @@ class PineconeDocumentStore(BaseDocumentStore):
         Return the count of embeddings in the document store.
 
         :param index: Optional index name to retrieve all documents from.
-        :param filters: Filters are not supported for `get_embedding_count` in Pinecone.
+        :param filters: filters: Optional filters to narrow down the documents with embedding which
+            will be counted. Filters are defined as nested dictionaries. The keys of the dictionaries
+            can be a logical operator (`"$and"`, `"$or"`, `"$not"`), a comparison operator (`"$eq"`,
+            `"$in"`, `"$gt"`, `"$gte"`, `"$lt"`, `"$lte"`), or a metadata field name.
+            Logical operator keys take a dictionary of metadata field names or logical operators as
+            value. Metadata field names take a dictionary of comparison operators as value. Comparison
+            operator keys take a single value or (in case of `"$in"`) a list of values as value.
+            If no logical operator is provided, `"$and"` is used as default operation. If no comparison
+            operator is provided, `"$eq"` (or `"$in"` if the comparison value is a list) is used as default
+            operation.
+                __Example__:
+
+                ```python
+                filters = {
+                    "$and": {
+                        "type": {"$eq": "article"},
+                        "date": {"$gte": "2015-01-01", "$lt": "2021-01-01"},
+                        "rating": {"$gte": 3},
+                        "$or": {
+                            "genre": {"$in": ["economy", "politics"]},
+                            "publisher": {"$eq": "nytimes"}
+                        }
+                    }
+                }
+                ```
         :param namespace: Optional namespace to count embeddings from. If not specified, None is default
         """
-        if filters:
-            raise NotImplementedError("Filters are not supported for get_embedding_count in PineconeDocumentStore")
-
-        index = self._index(index)
-        self._index_connection_exists(index)
-
-        pinecone_filters = self._meta_for_pinecone({self.type_metadata_field: self.document_with_embedding_metadata})
-        return self._get_vector_count(index, filters=pinecone_filters, namespace=namespace)
+        return self._get_vector_count(
+            index, filters=filters, namespace=namespace, types_metadata={self.document_with_embedding_metadata}
+        )
 
     def _validate_index_sync(self, index: Optional[str] = None):
         """
