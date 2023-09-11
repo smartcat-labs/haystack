@@ -34,6 +34,8 @@ AND_OPERATOR = "$and"
 IN_OPERATOR = "$in"
 EQ_OPERATOR = "$eq"
 
+DEFAULT_BATCH_SIZE = 32
+
 DocTypeMetadata = Literal["vector", "no-vector", "label"]
 
 
@@ -351,7 +353,7 @@ class PineconeDocumentStore(BaseDocumentStore):
 
         pinecone_index = self.pinecone_indexes[index]
         try:
-            stats = pinecone_index.describe_index_stats(filter=filters)
+            stats = pinecone_index.describe_index_stats(filter=pinecone_syntax_filter)
             namespaces = stats["namespaces"]
             if namespace not in namespaces and namespace is None:
                 namespace = ""
@@ -407,7 +409,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         :param index: Optional index name to use for the query. If not provided, the default index name is used.
         :param only_documents_without_embedding: If set to `True`, only documents without embeddings are counted.
         :param headers: PineconeDocumentStore does not support headers.
-        :param namespace: Optional namespace to count documents from. If not specified, None is default
+        :param namespace: Optional namespace to count documents from. If not specified, None is default.
         :param type_metadata: Optional value for `doc_type` metadata to reference documents that need to be counted.
             Parameter options:
                 - `"vector"`: Documents with embedding.
@@ -483,7 +485,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         self,
         documents: Union[List[dict], List[Document]],
         index: Optional[str] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         duplicate_documents: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         labels: Optional[bool] = False,
@@ -504,7 +506,7 @@ class PineconeDocumentStore(BaseDocumentStore):
                 - `"fail"`: An error is raised if the document ID of the document being added already exists.
         :param headers: PineconeDocumentStore does not support headers.
         :param labels: Tells us whether these records are labels or not. Defaults to False.
-        :param namespace: Optional namespace to write documents to. If not specified, None is default
+        :param namespace: Optional namespace to write documents to. If not specified, None is default.
         :raises DuplicateDocumentError: Exception trigger on duplicate document.
         """
         if headers:
@@ -618,7 +620,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         index: Optional[str] = None,
         update_existing_embeddings: bool = True,
         filters: Optional[FilterType] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         namespace: Optional[str] = None,
     ):
         """
@@ -659,7 +661,7 @@ class PineconeDocumentStore(BaseDocumentStore):
                 ```
         :param batch_size: Number of documents to process at a time. When working with large number of documents,
             batching can help reduce memory footprint.
-        :param namespace: Optional namespace to retrieve document from. If not specified, None is default
+        :param namespace: Optional namespace to retrieve document from. If not specified, None is default.
         """
         index = self._index(index)
         if index not in self.pinecone_indexes:
@@ -743,7 +745,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         index: Optional[str] = None,
         filters: Optional[FilterType] = None,
         return_embedding: Optional[bool] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         headers: Optional[Dict[str, str]] = None,
         type_metadata: Optional[DocTypeMetadata] = None,
         namespace: Optional[str] = None,
@@ -782,7 +784,7 @@ class PineconeDocumentStore(BaseDocumentStore):
                            batching can help reduce memory footprint.
         :param headers: Pinecone does not support headers.
         :param type_metadata: Value of `doc_type` metadata that indicates which documents need to be retrieved.
-        :param namespace: Optional namespace to retrieve documents from. If not specified, None is default
+        :param namespace: Optional namespace to retrieve documents from. If not specified, None is default.
         """
         if headers:
             raise NotImplementedError("PineconeDocumentStore does not support headers.")
@@ -807,7 +809,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         index: Optional[str] = None,
         filters: Optional[FilterType] = None,
         return_embedding: Optional[bool] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         headers: Optional[Dict[str, str]] = None,
         namespace: Optional[str] = None,
         type_metadata: Optional[DocTypeMetadata] = None,
@@ -848,7 +850,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         :param return_embedding: Whether to return the document embeddings.
         :param batch_size: When working with large number of documents, batching can help reduce memory footprint.
         :param headers: PineconeDocumentStore does not support headers.
-        :param namespace: Optional namespace to retrieve document from. If not specified, None is default
+        :param namespace: Optional namespace to retrieve document from. If not specified, None is default.
         :param type_metadata: Value of `doc_type` metadata that indicates which documents need to be retrieved.
         :param include_type_metadata: Indicates if `doc_type` value will be included in document metadata or not.
             If not specified, `doc_type` field will be dropped from document metadata.
@@ -866,7 +868,9 @@ class PineconeDocumentStore(BaseDocumentStore):
             # set default value for `doc_type` metadata field
             type_metadata = self._get_default_type_metadata(index, namespace)  # type: ignore
 
-        ids = self._get_all_document_ids(index=index, type_metadata=type_metadata, filters=filters, namespace=namespace)
+        ids = self._get_all_document_ids(
+            index=index, type_metadata=type_metadata, filters=filters, namespace=namespace, batch_size=batch_size
+        )
 
         if filters is not None and not ids:
             logger.warning(
@@ -893,6 +897,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         type_metadata: Optional[DocTypeMetadata] = None,
         filters: Optional[FilterType] = None,
         namespace: Optional[str] = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> List[str]:
         index = self._index(index)
         self._index_connection_exists(index)
@@ -905,16 +910,113 @@ class PineconeDocumentStore(BaseDocumentStore):
             # We have all of the IDs and don't need to extract from Pinecone
             return list(self.all_ids[index])
         else:
-            # Otherwise we must query and extract IDs using dummy query and `doc_type` metadata field for filtering
-            all_ids = self._get_ids(index, type_metadata, filters, namespace)
+            # Otherwise we must query and extract IDs from the original namespace, then move the retrieved embeddings
+            # to a temporary namespace and query again for new items. We repeat this process until all embeddings
+            # have been retrieved.
+            target_namespace = f"{namespace}-copy" if namespace is not None else "copy"
+            all_ids: Set[str] = set()
+            vector_id_matrix = ["dummy-id"]
+            with tqdm(
+                total=document_count, disable=not self.progress_bar, position=0, unit=" ids", desc="Retrieving IDs"
+            ) as progress_bar:
+                while vector_id_matrix:
+                    # Retrieve IDs from Pinecone
+                    vector_id_matrix = self._get_ids(
+                        index=index,
+                        namespace=namespace,
+                        filters=filters,
+                        type_metadata=type_metadata,
+                        batch_size=batch_size,
+                    )
+                    # Save IDs
+                    all_ids = all_ids.union(set(vector_id_matrix))
+                    # Move these IDs to new namespace
+                    self._move_documents_by_id_namespace(
+                        ids=vector_id_matrix,
+                        index=index,
+                        source_namespace=namespace,
+                        target_namespace=target_namespace,
+                        batch_size=batch_size,
+                    )
+                    progress_bar.set_description_str("Retrieved IDs")
+                    progress_bar.update(len(set(vector_id_matrix)))
+
+            # Now move all documents back to source namespace
+            self._namespace_cleanup(index=index, namespace=target_namespace, batch_size=batch_size)
+
             self._add_local_ids(index, list(all_ids))
             return list(all_ids)
+
+    def _move_documents_by_id_namespace(
+        self,
+        ids: List[str],
+        index: Optional[str] = None,
+        source_namespace: Optional[str] = None,
+        target_namespace: Optional[str] = "copy",
+        batch_size: int = DEFAULT_BATCH_SIZE,
+    ):
+        index = self._index(index)
+        if index not in self.pinecone_indexes:
+            raise PineconeDocumentStoreError(
+                f"Index named '{index}' does not exist. Try reinitializing PineconeDocumentStore() and running "
+                f"'update_embeddings()' to create and populate an index."
+            )
+
+        if source_namespace == target_namespace:
+            raise PineconeDocumentStoreError(
+                f"Source namespace '{source_namespace}' cannot be the same as target namespace '{target_namespace}'."
+            )
+        with tqdm(
+            total=len(ids), disable=not self.progress_bar, position=0, unit=" docs", desc="Moving Documents"
+        ) as progress_bar:
+            for i in range(0, len(ids), batch_size):
+                i_end = min(len(ids), i + batch_size)
+                # TODO if i == i_end:
+                #    break
+                id_batch = ids[i:i_end]
+                # Retrieve documents from source_namespace
+                result = self.pinecone_indexes[index].fetch(ids=id_batch, namespace=source_namespace)
+                vector_id_matrix = result["vectors"].keys()
+                meta_matrix = [result["vectors"][_id]["metadata"] for _id in vector_id_matrix]
+                embedding_matrix = [result["vectors"][_id]["values"] for _id in vector_id_matrix]
+                data_to_write_to_pinecone = list(zip(vector_id_matrix, embedding_matrix, meta_matrix))
+                # Store metadata nd embeddings in new target_namespace
+                self.pinecone_indexes[index].upsert(vectors=data_to_write_to_pinecone, namespace=target_namespace)
+                # Delete vectors from source_namespace
+                self.delete_documents(index=index, ids=ids[i:i_end], namespace=source_namespace, drop_ids=False)
+                progress_bar.set_description_str("Documents Moved")
+                progress_bar.update(len(id_batch))
+
+    def _namespace_cleanup(self, index: str, namespace: str, batch_size: int = DEFAULT_BATCH_SIZE):
+        """
+        Shifts vectors back from "-copy" namespace to the original namespace.
+        """
+        with tqdm(
+            total=1, disable=not self.progress_bar, position=0, unit=" namespaces", desc="Cleaning Namespace"
+        ) as progress_bar:
+            target_namespace = namespace[:-5] if namespace != "copy" else None
+            while True:
+                # Retrieve IDs from Pinecone
+                vector_id_matrix = self._get_ids(index=index, namespace=namespace, batch_size=batch_size)
+                # Once we reach final item, we break
+                if len(vector_id_matrix) == 0:
+                    break
+                # Move these IDs to new namespace
+                self._move_documents_by_id_namespace(
+                    ids=vector_id_matrix,
+                    index=index,
+                    source_namespace=namespace,
+                    target_namespace=target_namespace,
+                    batch_size=batch_size,
+                )
+            progress_bar.set_description_str("Cleaned Namespace")
+            progress_bar.update(1)
 
     def get_documents_by_id(
         self,
         ids: List[str],
         index: Optional[str] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         headers: Optional[Dict[str, str]] = None,
         return_embedding: Optional[bool] = None,
         namespace: Optional[str] = None,
@@ -929,7 +1031,7 @@ class PineconeDocumentStore(BaseDocumentStore):
             batching can help reduce memory footprint.
         :param headers: Pinecone does not support headers.
         :param return_embedding: Optional flag to return the embedding of the document.
-        :param namespace: Optional namespace to retrieve document from. If not specified, None is default
+        :param namespace: Optional namespace to retrieve document from. If not specified, None is default.
         :param include_type_metadata: Indicates if `doc_type` value will be included in document metadata or not.
             If not specified, `doc_type` field will be dropped from document metadata.
         """
@@ -985,7 +1087,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         :param index: Optional index name to retrieve all documents from.
         :param headers: Pinecone does not support headers.
         :param return_embedding: Optional flag to return the embedding of the document.
-        :param namespace: Optional namespace to retrieve document from. If not specified, None is default
+        :param namespace: Optional namespace to retrieve document from. If not specified, None is default.
         """
         documents = self.get_documents_by_id(
             ids=[id], index=index, headers=headers, return_embedding=return_embedding, namespace=namespace
@@ -1054,7 +1156,7 @@ class PineconeDocumentStore(BaseDocumentStore):
                 ```
         :param headers: PineconeDocumentStore does not support headers.
         :param drop_ids: Specifies if the locally stored IDs should be deleted. The default is True.
-        :param namespace: Optional namespace. If not specified, None is default
+        :param namespace: Optional namespace. If not specified, None is default.
         :param type_metadata: Optional value for `doc_type` metadata field as reference for documents to delete.
         :return None:
         """
@@ -1197,7 +1299,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         :param scale_score: Whether to scale the similarity score to the unit interval (range of [0,1]).
                             If true (default) similarity scores (e.g. cosine or dot_product) which naturally have a different value range will be scaled to a range of [0,1], where 1 means extremely relevant.
                             Otherwise raw similarity scores (e.g. cosine or dot_product) will be used.
-        :param namespace: Optional namespace to query document from. If not specified, None is default
+        :param namespace: Optional namespace to query document from. If not specified, None is default.
         :param type_metadata: Value of `doc_type` metadata that indicates which documents need to be queried.
         """
         if headers:
@@ -1353,23 +1455,25 @@ class PineconeDocumentStore(BaseDocumentStore):
     def _get_ids(
         self,
         index: str,
-        type_metadata: Optional[DocTypeMetadata],
-        filters: Optional[FilterType],
-        namespace: Optional[str],
+        namespace: Optional[str] = None,
+        type_metadata: Optional[DocTypeMetadata] = None,
+        filters: Optional[FilterType] = None,
+        batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> List[str]:
         """
         Retrieves a list of IDs that satisfy a particular filter condition (or any) using
         a dummy query embedding.
         """
         filters = filters or {}
-        filters = self._add_type_metadata_filter(filters, type_value=type_metadata)
+        if type_metadata:
+            filters = self._add_type_metadata_filter(filters, type_value=type_metadata)
         pinecone_syntax_filter = LogicalFilterClause.parse(filters).convert_to_pinecone() if filters else None
 
         # Retrieve embeddings from Pinecone
         try:
             res = self.pinecone_indexes[index].query(
                 self.dummy_query,
-                top_k=self.top_k_limit,
+                top_k=batch_size,
                 include_values=False,
                 include_metadata=False,
                 filter=pinecone_syntax_filter,
@@ -1600,7 +1704,7 @@ class PineconeDocumentStore(BaseDocumentStore):
         ids: Optional[List[str]] = None,
         filters: Optional[FilterType] = None,
         headers: Optional[Dict[str, str]] = None,
-        batch_size: int = 32,
+        batch_size: int = DEFAULT_BATCH_SIZE,
         namespace: Optional[str] = None,
     ):
         """
