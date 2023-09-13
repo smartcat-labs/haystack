@@ -1180,20 +1180,21 @@ class PineconeDocumentStore(BaseDocumentStore):
             self.pinecone_indexes[index].delete(delete_all=True, namespace=namespace)
             id_values = list(self.all_ids[index])
         else:
-            if ids is None:
-                # In this case we identify all IDs that satisfy the filter condition
-                id_values = self._get_all_document_ids(index=index, namespace=namespace, filters=pinecone_syntax_filter)
-            else:
-                id_values = ids
+            id_values = ids or []
             if pinecone_syntax_filter:
-                # We must first identify the IDs that satisfy the filter condition
-                docs = self.get_all_documents(index=index, namespace=namespace, filters=pinecone_syntax_filter)
-                filter_ids = [doc.id for doc in docs]
-                # Find the intersect
-                id_values = list(set(id_values).intersection(set(filter_ids)))
+                # Extract IDs for all documents that satisfy given filters
+                doc_ids = self._get_all_document_ids(index=index, namespace=namespace, filters=pinecone_syntax_filter)
+                # Extend the list of document IDs that should be deleted
+                id_values = list(set(id_values).union(set(doc_ids)))
             if id_values:
-                # Now we delete
-                self.pinecone_indexes[index].delete(ids=id_values, namespace=namespace)
+                if len(id_values) > self.top_k_limit_vectors:
+                    batch_size = self.top_k_limit_vectors
+                    while id_values:
+                        id_values_batch, id_values = id_values[:batch_size], id_values[batch_size:]
+                        self.pinecone_indexes[index].delete(ids=id_values_batch, namespace=namespace)
+                else:
+                    self.pinecone_indexes[index].delete(ids=id_values, namespace=namespace)
+
         if drop_ids:
             self.all_ids[index] = self.all_ids[index].difference(set(id_values))
 
