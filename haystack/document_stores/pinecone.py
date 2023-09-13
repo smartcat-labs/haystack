@@ -9,7 +9,6 @@ from itertools import islice
 from typing import Any, Dict, Generator, List, Literal, Optional, Set, Union
 
 import numpy as np
-from pinecone.core.client.exceptions import ApiException
 from tqdm import tqdm
 
 from haystack.document_stores import BaseDocumentStore
