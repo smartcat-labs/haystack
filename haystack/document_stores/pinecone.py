@@ -9,6 +9,7 @@ from itertools import islice
 from typing import Any, Dict, Generator, List, Literal, Optional, Set, Union
 
 import numpy as np
+from pinecone.core.client.exceptions import ApiException
 from tqdm import tqdm
 
 from haystack.document_stores import BaseDocumentStore
@@ -348,15 +349,23 @@ class PineconeDocumentStore(BaseDocumentStore):
 
         pinecone_syntax_filter = LogicalFilterClause.parse(filters).convert_to_pinecone() if filters else None
 
-        res = self.pinecone_indexes[index].query(
-            self.dummy_query,
-            top_k=self.top_k_limit,
-            include_values=False,
-            include_metadata=False,
-            filter=pinecone_syntax_filter,
-            namespace=namespace,
-        )
-        return len(res["matches"])
+        pinecone_index = self.pinecone_indexes[index]
+        try:
+            stats = pinecone_index.describe_index_stats(filter=filters)
+            namespaces = stats["namespaces"]
+            if namespace not in namespaces and namespace is None:
+                namespace = ""
+            return namespaces[namespace]["vector_count"] if namespace in namespaces else 0
+        except ApiException:
+            res = self.pinecone_indexes[index].query(
+                self.dummy_query,
+                top_k=self.top_k_limit,
+                include_values=False,
+                include_metadata=False,
+                filter=pinecone_syntax_filter,
+                namespace=namespace,
+            )
+            return len(res["matches"])
 
     def get_document_count(
         self,
