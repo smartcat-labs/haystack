@@ -9,7 +9,6 @@ from itertools import islice
 from typing import Any, Dict, Generator, List, Literal, Optional, Set, Union
 
 import numpy as np
-from pinecone.core.client.exceptions import ApiException
 from tqdm import tqdm
 
 from haystack.document_stores import BaseDocumentStore
@@ -21,6 +20,7 @@ from haystack.schema import Answer, Document, FilterType, Label, Span
 
 with LazyImport("Run 'pip install farm-haystack[pinecone]'") as pinecone_import:
     import pinecone
+    from pinecone.core.client.exceptions import ApiException
 
 
 logger = logging.getLogger(__name__)
