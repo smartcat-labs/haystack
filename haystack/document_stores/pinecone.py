@@ -29,6 +29,10 @@ DOCUMENT_WITH_EMBEDDING = "vector"
 DOCUMENT_WITHOUT_EMBEDDING = "no-vector"
 LABEL = "label"
 
+AND_OPERATOR = "$and"
+IN_OPERATOR = "$in"
+EQ_OPERATOR = "$eq"
+
 DocTypeMetadata = Literal["vector", "no-vector", "label"]
 
 
@@ -297,27 +301,28 @@ class PineconeDocumentStore(BaseDocumentStore):
         Add new filter for `doc_type` metadata field.
         """
         if type_value:
-            new_type_filter = {self.type_metadata_field: {"$eq": type_value}}
-            if "$and" not in filters:
+            new_type_filter = {self.type_metadata_field: {EQ_OPERATOR: type_value}}
+            if AND_OPERATOR not in filters and self.type_metadata_field not in filters:
                 # extend filters with new `doc_type` filter and add $and operator
                 filters.update(new_type_filter)
                 all_filters = filters
-                return {"$and": all_filters}
+                return {AND_OPERATOR: all_filters}
 
-            if self.type_metadata_field in filters["$and"]:  # type: ignore
-                current_type_filter = filters["$and"][self.type_metadata_field]  # type: ignore
-                type_values = [type_value]
+            filters_content = filters[AND_OPERATOR] if AND_OPERATOR in filters else filters
+            if self.type_metadata_field in filters_content:  # type: ignore
+                current_type_filter = filters_content[self.type_metadata_field]  # type: ignore
+                type_values = {type_value}
                 if isinstance(current_type_filter, str):
-                    type_values.append(current_type_filter)  # type: ignore
+                    type_values.add(current_type_filter)  # type: ignore
                 elif isinstance(current_type_filter, dict):
-                    if "$eq" in current_type_filter:
+                    if EQ_OPERATOR in current_type_filter:
                         # current `doc_type` filter has single value
-                        type_values.append(current_type_filter["$eq"])
+                        type_values.add(current_type_filter[EQ_OPERATOR])
                     else:
                         # current `doc_type` filter has multiple values
-                        type_values.extend(current_type_filter["$in"])
-                new_type_filter = {self.type_metadata_field: {"$in": type_values}}  # type: ignore
-            filters["$and"].update(new_type_filter)  # type: ignore
+                        type_values.update(set(current_type_filter[IN_OPERATOR]))
+                new_type_filter = {self.type_metadata_field: {IN_OPERATOR: list(type_values)}}  # type: ignore
+            filters_content.update(new_type_filter)  # type: ignore
 
         return filters
 
@@ -327,10 +332,8 @@ class PineconeDocumentStore(BaseDocumentStore):
         will be `vector`, otherwise it will be `no-vector`.
         """
         if self.get_embedding_count(index=index, namespace=namespace) > 0:
-            type_metadata_value = self.document_with_embedding_metadata
-        else:
-            type_metadata_value = self.document_without_embedding_metadata
-        return type_metadata_value
+            return self.document_with_embedding_metadata
+        return self.document_without_embedding_metadata
 
     def _get_vector_count(
         self, index: str, filters: Optional[FilterType], namespace: Optional[str], types_metadata: Set[DocTypeMetadata]
@@ -1619,9 +1622,9 @@ class PineconeDocumentStore(BaseDocumentStore):
                 i_end = min(i + batch_size, len(ids))
                 update_ids = ids[i:i_end]
                 if filters:
-                    filters["label-id"] = {"$in": update_ids}
+                    filters["label-id"] = {IN_OPERATOR: update_ids}
                 else:
-                    filters = {"label-id": {"$in": update_ids}}
+                    filters = {"label-id": {IN_OPERATOR: update_ids}}
                 # Retrieve embeddings and metadata for the batch of documents
                 docs = self.query_by_embedding(
                     dummy_query,
