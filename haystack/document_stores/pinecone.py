@@ -36,6 +36,8 @@ EQ_OPERATOR = "$eq"
 
 DEFAULT_BATCH_SIZE = 32
 
+PINECONE_STARTER_POD = "starter"
+
 DocTypeMetadata = Literal["vector", "no-vector", "label"]
 
 
@@ -343,6 +345,7 @@ class PineconeDocumentStore(BaseDocumentStore):
     ) -> int:
         index = self._index(index)
         self._index_connection_exists(index)
+        pinecone_index = self.pinecone_indexes[index]
 
         filters = filters or {}
         for type_value in types_metadata:
@@ -351,23 +354,28 @@ class PineconeDocumentStore(BaseDocumentStore):
 
         pinecone_syntax_filter = LogicalFilterClause.parse(filters).convert_to_pinecone() if filters else None
 
-        pinecone_index = self.pinecone_indexes[index]
-        try:
+        if pinecone.describe_index(index).pod_type != PINECONE_STARTER_POD:
             stats = pinecone_index.describe_index_stats(filter=pinecone_syntax_filter)
             namespaces = stats["namespaces"]
             if namespace not in namespaces and namespace is None:
                 namespace = ""
             return namespaces[namespace]["vector_count"] if namespace in namespaces else 0
-        except ApiException:
-            res = self.pinecone_indexes[index].query(
-                self.dummy_query,
-                top_k=self.top_k_limit,
-                include_values=False,
-                include_metadata=False,
-                filter=pinecone_syntax_filter,
-                namespace=namespace,
+
+        # Due to missing support for metadata filtering in `describe_index_stats()` method for `gcp-starter`, use dummy query for getting vector count
+        res = self.pinecone_indexes[index].query(
+            self.dummy_query,
+            top_k=self.top_k_limit,
+            include_values=False,
+            include_metadata=False,
+            filter=pinecone_syntax_filter,
+        )
+        vector_count = len(res["matches"])
+        if vector_count >= self.top_k_limit:
+            logger.warning(
+                "Current index type 'Starter' doesn't support features 'Namespace' and metadata filtering as part of describe_index_stats operation. "
+                f"Limit for fetching documents in 'Starter' index type is {self.top_k_limit}."
             )
-            return len(res["matches"])
+        return vector_count
 
     def get_document_count(
         self,
@@ -910,39 +918,49 @@ class PineconeDocumentStore(BaseDocumentStore):
             # We have all of the IDs and don't need to extract from Pinecone
             return list(self.all_ids[index])
         else:
-            # Otherwise we must query and extract IDs from the original namespace, then move the retrieved embeddings
-            # to a temporary namespace and query again for new items. We repeat this process until all embeddings
-            # have been retrieved.
-            target_namespace = f"{namespace}-copy" if namespace is not None else "copy"
-            all_ids: Set[str] = set()
-            vector_id_matrix = ["dummy-id"]
-            with tqdm(
-                total=document_count, disable=not self.progress_bar, position=0, unit=" ids", desc="Retrieving IDs"
-            ) as progress_bar:
-                while vector_id_matrix:
-                    # Retrieve IDs from Pinecone
-                    vector_id_matrix = self._get_ids(
-                        index=index,
-                        namespace=namespace,
-                        filters=filters,
-                        type_metadata=type_metadata,
-                        batch_size=batch_size,
-                    )
-                    # Save IDs
-                    all_ids = all_ids.union(set(vector_id_matrix))
-                    # Move these IDs to new namespace
-                    self._move_documents_by_id_namespace(
-                        ids=vector_id_matrix,
-                        index=index,
-                        source_namespace=namespace,
-                        target_namespace=target_namespace,
-                        batch_size=batch_size,
-                    )
-                    progress_bar.set_description_str("Retrieved IDs")
-                    progress_bar.update(len(set(vector_id_matrix)))
+            if pinecone.describe_index(index).pod_type == PINECONE_STARTER_POD:
+                # Due to missing support for Namespace in Starter Pinecone index type, retrieve up to 10000 vectors
+                logger.warning(
+                    "Current index type 'Starter' doesn't support 'Namespace' feature. "
+                    f"Limit for fetching documents in 'Starter' index type is {self.top_k_limit}."
+                )
+                all_ids = self._get_ids(
+                    index=index, filters=filters, type_metadata=type_metadata, batch_size=self.top_k_limit
+                )
+            else:
+                # If we don't have all IDs, we must query and extract IDs from the original namespace, then move the retrieved embeddings
+                # to a temporary namespace and query again for new items. We repeat this process until all embeddings
+                # have been retrieved.
+                target_namespace = f"{namespace}-copy" if namespace is not None else "copy"
+                all_ids: Set[str] = set()
+                vector_id_matrix = ["dummy-id"]
+                with tqdm(
+                    total=document_count, disable=not self.progress_bar, position=0, unit=" ids", desc="Retrieving IDs"
+                ) as progress_bar:
+                    while vector_id_matrix:
+                        # Retrieve IDs from Pinecone
+                        vector_id_matrix = self._get_ids(
+                            index=index,
+                            namespace=namespace,
+                            filters=filters,
+                            type_metadata=type_metadata,
+                            batch_size=batch_size,
+                        )
+                        # Save IDs
+                        all_ids = all_ids.union(set(vector_id_matrix))
+                        # Move these IDs to new namespace
+                        self._move_documents_by_id_namespace(
+                            ids=vector_id_matrix,
+                            index=index,
+                            source_namespace=namespace,
+                            target_namespace=target_namespace,
+                            batch_size=batch_size,
+                        )
+                        progress_bar.set_description_str("Retrieved IDs")
+                        progress_bar.update(len(set(vector_id_matrix)))
 
-            # Now move all documents back to source namespace
-            self._namespace_cleanup(index=index, namespace=target_namespace, batch_size=batch_size)
+                # Now move all documents back to source namespace
+                self._namespace_cleanup(index=index, namespace=target_namespace, batch_size=batch_size)
 
             self._add_local_ids(index, list(all_ids))
             return list(all_ids)
@@ -1049,7 +1067,6 @@ class PineconeDocumentStore(BaseDocumentStore):
             i_end = min(len(ids), i + batch_size)
             id_batch = ids[i:i_end]
             result = self.pinecone_indexes[index].fetch(ids=id_batch, namespace=namespace)
-
             vector_id_matrix = []
             meta_matrix = []
             embedding_matrix = []
@@ -1180,20 +1197,21 @@ class PineconeDocumentStore(BaseDocumentStore):
             self.pinecone_indexes[index].delete(delete_all=True, namespace=namespace)
             id_values = list(self.all_ids[index])
         else:
-            if ids is None:
-                # In this case we identify all IDs that satisfy the filter condition
-                id_values = self._get_all_document_ids(index=index, namespace=namespace, filters=pinecone_syntax_filter)
-            else:
-                id_values = ids
+            id_values = ids or []
             if pinecone_syntax_filter:
-                # We must first identify the IDs that satisfy the filter condition
-                docs = self.get_all_documents(index=index, namespace=namespace, filters=pinecone_syntax_filter)
-                filter_ids = [doc.id for doc in docs]
-                # Find the intersect
-                id_values = list(set(id_values).intersection(set(filter_ids)))
+                # Extract IDs for all documents that satisfy given filters
+                doc_ids = self._get_all_document_ids(index=index, namespace=namespace, filters=filters)
+                # Extend the list of document IDs that should be deleted
+                id_values = list(set(id_values).union(set(doc_ids)))
             if id_values:
-                # Now we delete
-                self.pinecone_indexes[index].delete(ids=id_values, namespace=namespace)
+                if len(id_values) > self.top_k_limit_vectors:
+                    batch_size = self.top_k_limit_vectors
+                    while id_values:
+                        id_values_batch, id_values = id_values[:batch_size], id_values[batch_size:]
+                        self.pinecone_indexes[index].delete(ids=id_values_batch, namespace=namespace)
+                else:
+                    self.pinecone_indexes[index].delete(ids=id_values, namespace=namespace)
+
         if drop_ids:
             self.all_ids[index] = self.all_ids[index].difference(set(id_values))
 

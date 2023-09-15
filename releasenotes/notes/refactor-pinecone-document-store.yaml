@@ -1,6 +1,13 @@
 ---
 enhancements:
   - |
-    Refactor PineconeDocumentStore to use metadata instead of namespaces 
-    for distinction between documents with embeddings, documents without 
+    Refactor PineconeDocumentStore to use metadata instead of namespaces
+    for distinction between documents with embeddings, documents without
     embeddings and labels
+upgrade:
+  - |
+    This update enables all Pinecone index types to be used, including Starter.
+    Previously, Pinecone Starter index type couldn't be used as document store. Due to limitations of this index type
+    (https://docs.pinecone.io/docs/starter-environment), in current implementation fetching documents is limited to
+    Pinecone query vector limit (10000 vectors). Accordingly, if the number of documents in the index is above this limit,
+    some of PineconeDocumentStore functions will be limited.
